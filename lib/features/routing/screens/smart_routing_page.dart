@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:mapbox_maps_flutter/mapbox_maps_flutter.dart';
@@ -22,8 +23,15 @@ class _SmartRoutingPageState extends State<SmartRoutingPage> {
   );
   bool includeEvents = true;
   SmartRoutePlan? plan;
+  _LngLat? _lastOrigin;
+  _LngLat? _lastDestination;
   MapboxMap? _mapboxMap;
+  PolylineAnnotationManager? _routeLineManager;
+  CircleAnnotationManager? _circleManager;
+  late final Widget _mapView;
   bool _isRouting = false;
+  bool _mapReady = false;
+  String? _nextInstruction;
 
   static const String _mapboxToken = String.fromEnvironment(
     'MAPBOX_ACCESS_TOKEN',
@@ -39,6 +47,12 @@ class _SmartRoutingPageState extends State<SmartRoutingPage> {
   void initState() {
     super.initState();
     MapboxOptions.setAccessToken(_mapboxToken);
+    _mapView = MapWidget(
+      key: const ValueKey('mapbox-view'),
+      cameraOptions: CameraOptions(center: _defaultCenter, zoom: _defaultZoom),
+      styleUri: MapboxStyles.MAPBOX_STREETS,
+      onMapCreated: _onMapCreated,
+    );
   }
 
   @override
@@ -48,9 +62,22 @@ class _SmartRoutingPageState extends State<SmartRoutingPage> {
     super.dispose();
   }
 
+  Future<void> _onMapCreated(MapboxMap mapboxMap) async {
+    _mapboxMap = mapboxMap;
+    _routeLineManager =
+        await mapboxMap.annotations.createPolylineAnnotationManager();
+    _circleManager =
+        await mapboxMap.annotations.createCircleAnnotationManager();
+    setState(() => _mapReady = true);
+  }
+
   Future<void> _planRoute(BuildContext context) async {
     if (_mapboxToken.isEmpty || _mapboxToken == 'REPLACE_WITH_MAPBOX_TOKEN') {
       _showMapSnack(context, 'Add a valid Mapbox token to plan routes');
+      return;
+    }
+    if (!_mapReady) {
+      _showMapSnack(context, 'Map is still loading');
       return;
     }
 
@@ -58,22 +85,52 @@ class _SmartRoutingPageState extends State<SmartRoutingPage> {
 
     try {
       final origin = await _geocodePlace(fromController.text.trim(), context);
-      final destination =
-          await _geocodePlace(toController.text.trim(), context);
+      final destination = await _geocodePlace(
+        toController.text.trim(),
+        context,
+      );
 
       if (origin == null || destination == null) {
         return;
       }
 
-      final route =
-          await _fetchRoute(origin: origin, destination: destination, context: context);
-      if (route == null) {
+      final primaryRoute = await _fetchRoute(
+        origin: origin,
+        destination: destination,
+        context: context,
+      );
+      if (primaryRoute == null) {
         return;
+      }
+      var route = primaryRoute;
+
+      final eventsOnRoute = includeEvents ? _generateEvents() : <String>[];
+      final needsDetour = eventsOnRoute.any(
+        (e) =>
+            e.toLowerCase().contains('closure') ||
+            e.toLowerCase().contains('accident'),
+      );
+
+      if (needsDetour) {
+        final alternate = await _fetchRoute(
+          origin: origin,
+          destination: destination,
+          context: context,
+          preferAlternate: true,
+          mustBeAlternate: true,
+        );
+        if (alternate != null) {
+          route = alternate;
+          eventsOnRoute.insert(0, 'Dynamic reroute applied');
+        }
       }
 
       final distanceKm = route.distanceMeters / 1000;
       final eta = _formatDuration(Duration(seconds: route.durationSeconds));
       final co2 = '${(distanceKm * 0.12).toStringAsFixed(2)} kg';
+
+      await _drawRoute(route);
+      await _focusRoute(route);
 
       setState(() {
         plan = SmartRoutePlan(
@@ -81,21 +138,151 @@ class _SmartRoutingPageState extends State<SmartRoutingPage> {
           eta: eta,
           co2Savings: co2,
           congestionScore: route.congestionLabel,
-          events: includeEvents ? route.events : [],
+          events: includeEvents ? eventsOnRoute : [],
           instructions: route.steps,
         );
+        _nextInstruction = route.steps.isNotEmpty ? route.steps.first : null;
+        _lastOrigin = origin;
+        _lastDestination = destination;
       });
-
-      // Focus map near the origin of the route.
-      await _mapboxMap?.flyTo(
-        CameraOptions(center: origin.toPoint(), zoom: 12.5),
-        MapAnimationOptions(duration: 800, startDelay: 0),
-      );
     } catch (e) {
       _showMapSnack(context, 'Could not plan route: $e');
     } finally {
       if (mounted) setState(() => _isRouting = false);
     }
+  }
+
+  List<String> _generateEvents() {
+    final seed = DateTime.now().millisecondsSinceEpoch;
+    final rng = Random(seed);
+    final pool = <String>[
+      'Accident reported ahead, suggesting detour.',
+      'Pop-up event nearby, mild slowdown.',
+      'Road closure detected, rerouting.',
+      'Heavy rain pockets, adjusted ETA.',
+      'Lane restriction in 2 km.',
+    ];
+    pool.shuffle(rng);
+    final count = rng.nextInt(3) + 1; // 1..3 events
+    return pool.take(count).toList();
+  }
+
+  Future<void> _triggerDemoReroute() async {
+    if (_mapboxMap == null ||
+        !_mapReady ||
+        _lastOrigin == null ||
+        _lastDestination == null) {
+      _showMapSnack(context, 'Plan a route first to demo reroute');
+      return;
+    }
+
+    final demoEvents = _generateEvents();
+    demoEvents.insert(0, 'Demo disruption triggered, rerouting');
+
+    final alternate = await _fetchRoute(
+      origin: _lastOrigin!,
+      destination: _lastDestination!,
+      context: context,
+      preferAlternate: true,
+      mustBeAlternate: true,
+    );
+
+    if (alternate == null) {
+      _showMapSnack(context, 'No alternate route available for this demo');
+      return;
+    }
+
+    await _drawRoute(alternate);
+    await _focusRoute(alternate);
+
+    final distanceKm = alternate.distanceMeters / 1000;
+    final eta = _formatDuration(Duration(seconds: alternate.durationSeconds));
+    final co2 = '${(distanceKm * 0.12).toStringAsFixed(2)} kg';
+
+    setState(() {
+      plan = SmartRoutePlan(
+        distance: '${distanceKm.toStringAsFixed(1)} km',
+        eta: eta,
+        co2Savings: co2,
+        congestionScore: alternate.congestionLabel,
+        events: includeEvents ? demoEvents : [],
+        instructions: alternate.steps,
+      );
+      _nextInstruction =
+          alternate.steps.isNotEmpty ? alternate.steps.first : null;
+    });
+  }
+
+  Future<void> _drawRoute(_RouteResult route) async {
+    if (_routeLineManager == null || _circleManager == null) return;
+
+    await _routeLineManager!.deleteAll();
+    await _circleManager!.deleteAll();
+
+    if (route.path.isEmpty) return;
+
+    final line = route.path
+        .map((p) => Position(p.lng, p.lat))
+        .toList(growable: false);
+
+    await _routeLineManager!.create(
+      PolylineAnnotationOptions(
+        geometry: LineString(coordinates: line),
+        lineColor: const Color(0xFF2D6AA7).value,
+        lineWidth: 6.0,
+      ),
+    );
+
+    await _circleManager!.create(
+      CircleAnnotationOptions(
+        geometry: route.origin.toPoint(),
+        circleColor: Colors.white.value,
+        circleRadius: 7.0,
+        circleStrokeWidth: 3.0,
+        circleStrokeColor: const Color(0xFF2D6AA7).value,
+      ),
+    );
+
+    await _circleManager!.create(
+      CircleAnnotationOptions(
+        geometry: route.destination.toPoint(),
+        circleColor: Colors.white.value,
+        circleRadius: 7.0,
+        circleStrokeWidth: 3.0,
+        circleStrokeColor: const Color(0xFFF6A609).value,
+      ),
+    );
+  }
+
+  Future<void> _focusRoute(_RouteResult route) async {
+    if (_mapboxMap == null || route.path.isEmpty) return;
+
+    final lats = route.path.map((p) => p.lat);
+    final lngs = route.path.map((p) => p.lng);
+    final minLat = lats.reduce(min);
+    final maxLat = lats.reduce(max);
+    final minLng = lngs.reduce(min);
+    final maxLng = lngs.reduce(max);
+
+    final bounds = CoordinateBounds(
+      southwest: Point(coordinates: Position(minLng, minLat)),
+      northeast: Point(coordinates: Position(maxLng, maxLat)),
+      infiniteBounds: false,
+    );
+
+    final camera = await _mapboxMap!.cameraForCoordinateBounds(
+      bounds,
+      MbxEdgeInsets(top: 80, left: 20, bottom: 260, right: 20),
+      null,
+      null,
+      null,
+      null,
+    );
+
+    await _mapboxMap!.flyTo(
+      camera,
+      MapAnimationOptions(duration: 900, startDelay: 0),
+    );
   }
 
   Future<void> _recenterMap(BuildContext context) async {
@@ -135,10 +322,7 @@ class _SmartRoutingPageState extends State<SmartRoutingPage> {
     final uri = Uri.https(
       'api.mapbox.com',
       '/geocoding/v5/mapbox.places/${Uri.encodeComponent(query)}.json',
-      {
-        'limit': '1',
-        'access_token': _mapboxToken,
-      },
+      {'limit': '1', 'access_token': _mapboxToken},
     );
 
     final response = await http.get(uri);
@@ -154,24 +338,30 @@ class _SmartRoutingPageState extends State<SmartRoutingPage> {
       return null;
     }
 
-    final center = (features.first as Map<String, dynamic>)['center'] as List<dynamic>;
+    final center =
+        (features.first as Map<String, dynamic>)['center'] as List<dynamic>;
     if (center.length < 2) {
       _showMapSnack(context, 'Invalid coordinates for "$query"');
       return null;
     }
 
-    return _LngLat(lng: (center[0] as num).toDouble(), lat: (center[1] as num).toDouble());
+    return _LngLat(
+      lng: (center[0] as num).toDouble(),
+      lat: (center[1] as num).toDouble(),
+    );
   }
 
   Future<_RouteResult?> _fetchRoute({
     required _LngLat origin,
     required _LngLat destination,
     required BuildContext context,
+    bool preferAlternate = false,
+    bool mustBeAlternate = false,
   }) async {
     final path =
         '/directions/v5/mapbox/driving-traffic/${origin.lng},${origin.lat};${destination.lng},${destination.lat}';
     final uri = Uri.https('api.mapbox.com', path, {
-      'alternatives': 'false',
+      'alternatives': 'true',
       'geometries': 'geojson',
       'overview': 'simplified',
       'steps': 'true',
@@ -191,7 +381,23 @@ class _SmartRoutingPageState extends State<SmartRoutingPage> {
       return null;
     }
 
-    final route = routes.first as Map<String, dynamic>;
+    // Pick the fastest route when alternatives are available.
+    routes.sort((a, b) {
+      final ad =
+          ((a as Map<String, dynamic>)['duration'] as num?)?.toDouble() ??
+          double.infinity;
+      final bd =
+          ((b as Map<String, dynamic>)['duration'] as num?)?.toDouble() ??
+          double.infinity;
+      return ad.compareTo(bd);
+    });
+
+    if (mustBeAlternate && routes.length < 2) {
+      return null;
+    }
+
+    final chosenIndex = preferAlternate && routes.length > 1 ? 1 : 0;
+    final route = routes[chosenIndex] as Map<String, dynamic>;
     final distance = (route['distance'] as num?)?.toDouble();
     final duration = (route['duration'] as num?)?.toDouble();
     if (distance == null || duration == null) {
@@ -207,7 +413,8 @@ class _SmartRoutingPageState extends State<SmartRoutingPage> {
       for (final step in legSteps) {
         final name = (step as Map<String, dynamic>)['name'] as String?;
         final maneuver = step['maneuver'] as Map<String, dynamic>?;
-        final instruction = maneuver != null ? maneuver['instruction'] as String? : null;
+        final instruction =
+            maneuver != null ? maneuver['instruction'] as String? : null;
         if (instruction != null && instruction.isNotEmpty) {
           steps.add(instruction);
         } else if (name != null && name.isNotEmpty) {
@@ -218,12 +425,32 @@ class _SmartRoutingPageState extends State<SmartRoutingPage> {
 
     final congestion = _congestionFromRoute(route);
 
+    final geometry = route['geometry'] as Map<String, dynamic>?;
+    final coords =
+        (geometry?['coordinates'] as List<dynamic>? ?? [])
+            .whereType<List<dynamic>>()
+            .where((c) => c.length >= 2)
+            .map(
+              (c) => _LngLat(
+                lng: (c[0] as num).toDouble(),
+                lat: (c[1] as num).toDouble(),
+              ),
+            )
+            .toList();
+
+    if (coords.isEmpty) {
+      _showMapSnack(context, 'Route geometry missing');
+      return null;
+    }
+
     return _RouteResult(
       distanceMeters: distance,
       durationSeconds: duration.round(),
       congestionLabel: congestion,
       steps: steps.isEmpty ? const ['Follow on-screen guidance.'] : steps,
-      events: const ['Live traffic from Mapbox applied'],
+      path: coords,
+      origin: origin,
+      destination: destination,
     );
   }
 
@@ -254,236 +481,375 @@ class _SmartRoutingPageState extends State<SmartRoutingPage> {
   Widget build(BuildContext context) {
     final SmartRoutePlan effectivePlan =
         plan ?? SmartRoutePlan.placeholder(includeEvents: includeEvents);
+    final bool tokenMissing =
+        _mapboxToken.isEmpty || _mapboxToken == 'REPLACE_WITH_MAPBOX_TOKEN';
+
     return Scaffold(
-      appBar: AppBar(title: const Text('Smart routing')),
-      body: ListView(
-        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+      extendBodyBehindAppBar: true,
+      appBar: AppBar(
+        title: const Text(
+          'Smart routing',
+          style: TextStyle(color: Colors.black87, fontWeight: FontWeight.w800),
+        ),
+        backgroundColor: const Color.fromARGB(0, 255, 255, 255),
+        elevation: 0,
+      ),
+      body: Stack(
         children: [
-          Text(
-            'Plan with live insights.',
-            style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-              fontWeight: FontWeight.w800,
-              color: AppTheme.primary,
+          Positioned.fill(child: _mapView),
+          if (tokenMissing)
+            Positioned(
+              top: 20,
+              left: 16,
+              right: 16,
+              child: SafeArea(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 10,
+                  ),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFF6A609),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: const Text(
+                    'Add your Mapbox access token to enable the live map.',
+                    style: TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                ),
+              ),
             ),
-          ),
-          const SizedBox(height: 12),
-          Text(
-            'Layer live events, eco impact, and guided steps on top of your route.',
-            style: Theme.of(
-              context,
-            ).textTheme.bodyMedium?.copyWith(color: Colors.black54),
-          ),
-          const SizedBox(height: 14),
-          _MapboxView(
-            accessToken: _mapboxToken,
-            initialCamera: CameraOptions(
-              center: _defaultCenter,
-              zoom: _defaultZoom,
-            ),
-            onMapCreated: (map) => _mapboxMap = map,
-            onRecenter: () => _recenterMap(context),
-            onLayers: () => _showMapSnack(context, 'Map layers coming soon'),
-            onZoomIn: () => _changeZoom(context, 1),
-            onZoomOut: () => _changeZoom(context, -1),
-          ),
-          const SizedBox(height: 16),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(18),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  TextField(
-                    controller: fromController,
-                    decoration: const InputDecoration(
-                      labelText: 'From',
-                      prefixIcon: Icon(Icons.trip_origin),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: toController,
-                    decoration: const InputDecoration(
-                      labelText: 'To',
-                      prefixIcon: Icon(Icons.flag),
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  SwitchListTile(
-                    value: includeEvents,
-                    onChanged: (value) => setState(() => includeEvents = value),
-                    title: const Text('Include live events on route'),
-                    subtitle: const Text(
-                      'Detours for concerts, closures, and disruptions',
-                    ),
-                  ),
-                  const SizedBox(height: 10),
-                  SizedBox(
-                    width: double.infinity,
-                    child: ElevatedButton.icon(
-                      onPressed:
-                          _isRouting ? null : () => _planRoute(context),
-                      icon: const Icon(Icons.play_circle_fill),
-                      label: Text(_isRouting ? 'Planning…' : 'Plan route'),
-                    ),
-                  ),
-                ],
+          SafeArea(
+            child: Align(
+              alignment: Alignment.topLeft,
+              child: Padding(
+                padding: const EdgeInsets.only(left: 12, top: 8, right: 90),
+                child: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 250),
+                  child:
+                      _nextInstruction == null
+                          ? const SizedBox.shrink()
+                          : Container(
+                            key: const ValueKey('next-instruction'),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 10,
+                            ),
+                            decoration: BoxDecoration(
+                              color: Colors.white,
+                              borderRadius: BorderRadius.circular(14),
+                              boxShadow: const [
+                                BoxShadow(
+                                  color: Color(0x14000000),
+                                  blurRadius: 10,
+                                  offset: Offset(0, 4),
+                                ),
+                              ],
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const Icon(
+                                  Icons.navigation,
+                                  color: Color(0xFF2D6AA7),
+                                ),
+                                const SizedBox(width: 10),
+                                Flexible(
+                                  child: Text(
+                                    _nextInstruction!,
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.w700,
+                                      color: Colors.black87,
+                                    ),
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                ),
               ),
             ),
           ),
-          const SizedBox(height: 16),
-          _InsightRow(plan: effectivePlan),
-          const SizedBox(height: 12),
-          if (includeEvents)
-            Card(
+          SafeArea(
+            child: Align(
+              alignment: Alignment.topRight,
               child: Padding(
-                padding: const EdgeInsets.all(16),
+                padding: const EdgeInsets.only(right: 12, top: 8),
                 child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
                   children: [
-                    Text(
-                      'Events on route',
-                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                        fontWeight: FontWeight.w700,
-                      ),
+                    _FloatingControlButton(
+                      icon: Icons.my_location,
+                      onTap: () => _recenterMap(context),
+                      tooltip: 'Recenter',
                     ),
-                    const SizedBox(height: 8),
-                    if (effectivePlan.events.isEmpty)
-                      const Text('No major events detected.')
-                    else
-                      ...effectivePlan.events
-                          .map(
-                            (event) => ListTile(
-                              contentPadding: EdgeInsets.zero,
-                              leading: const Icon(
-                                Icons.emergency_share,
-                                color: Color(0xFFF6A609),
-                              ),
-                              title: Text(event),
-                            ),
-                          )
-                          .toList(),
+                    const SizedBox(height: 10),
+                    _FloatingControlButton(
+                      icon: Icons.layers,
+                      onTap:
+                          () =>
+                              _showMapSnack(context, 'Map layers coming soon'),
+                      tooltip: 'Layers',
+                    ),
+                    const SizedBox(height: 10),
+                    _FloatingControlButton(
+                      icon: Icons.add,
+                      onTap: () => _changeZoom(context, 1),
+                      tooltip: 'Zoom in',
+                    ),
+                    const SizedBox(height: 10),
+                    _FloatingControlButton(
+                      icon: Icons.remove,
+                      onTap: () => _changeZoom(context, -1),
+                      tooltip: 'Zoom out',
+                    ),
                   ],
                 ),
               ),
             ),
-          const SizedBox(height: 12),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Live monitoring',
-                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                      fontWeight: FontWeight.w700,
+          ),
+          Align(
+            alignment: Alignment.bottomCenter,
+            child: DraggableScrollableSheet(
+              initialChildSize: 0.36,
+              minChildSize: 0.24,
+              maxChildSize: 0.9,
+              builder: (context, controller) {
+                return Container(
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: const BorderRadius.vertical(
+                      top: Radius.circular(22),
                     ),
-                  ),
-                  const SizedBox(height: 10),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: _pill(
-                          'Congestion',
-                          effectivePlan.congestionScore,
-                          AppTheme.accent,
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: _pill(
-                          'ETA',
-                          effectivePlan.eta,
-                          AppTheme.primary,
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: _pill(
-                          'Distance',
-                          effectivePlan.distance,
-                          const Color(0xFFF6A609),
-                        ),
+                    boxShadow: const [
+                      BoxShadow(
+                        color: Color(0x1A000000),
+                        blurRadius: 12,
+                        offset: Offset(0, -4),
                       ),
                     ],
                   ),
-                ],
-              ),
-            ),
-          ),
-          const SizedBox(height: 12),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Eco impact',
-                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                      fontWeight: FontWeight.w700,
+                  child: SingleChildScrollView(
+                    controller: controller,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 18,
+                      vertical: 14,
                     ),
-                  ),
-                  const SizedBox(height: 10),
-                  const Text('CO2 savings compared to typical route'),
-                  const SizedBox(height: 6),
-                  LinearProgressIndicator(
-                    value: 0.62,
-                    backgroundColor: const Color(0xFFE8F1FA),
-                    color: AppTheme.accent,
-                    minHeight: 10,
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    'Estimated savings: ${effectivePlan.co2Savings}',
-                    style: const TextStyle(fontWeight: FontWeight.w700),
-                  ),
-                ],
-              ),
-            ),
-          ),
-          const SizedBox(height: 12),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Route instructions',
-                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                  const SizedBox(height: 10),
-                  ...effectivePlan.instructions
-                      .asMap()
-                      .entries
-                      .map(
-                        (entry) => ListTile(
-                          contentPadding: EdgeInsets.zero,
-                          leading: CircleAvatar(
-                            radius: 16,
-                            backgroundColor: AppTheme.primary,
-                            child: Text(
-                              '${entry.key + 1}',
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontWeight: FontWeight.bold,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Container(
+                          width: 38,
+                          height: 4,
+                          margin: const EdgeInsets.only(bottom: 12),
+                          decoration: BoxDecoration(
+                            color: Colors.black26,
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                        ),
+                        Text(
+                          'Plan with live insights.',
+                          style: Theme.of(
+                            context,
+                          ).textTheme.titleLarge?.copyWith(
+                            fontWeight: FontWeight.w800,
+                            color: AppTheme.primary,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          'Layer live events, eco impact, and guided steps on top of your route.',
+                          style: Theme.of(context).textTheme.bodyMedium
+                              ?.copyWith(color: Colors.black54),
+                        ),
+                        const SizedBox(height: 14),
+                        Card(
+                          child: Padding(
+                            padding: const EdgeInsets.all(18),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                TextField(
+                                  controller: fromController,
+                                  decoration: const InputDecoration(
+                                    labelText: 'From',
+                                    prefixIcon: Icon(Icons.trip_origin),
+                                  ),
+                                ),
+                                const SizedBox(height: 12),
+                                TextField(
+                                  controller: toController,
+                                  decoration: const InputDecoration(
+                                    labelText: 'To',
+                                    prefixIcon: Icon(Icons.flag),
+                                  ),
+                                ),
+                                const SizedBox(height: 8),
+                                SwitchListTile(
+                                  value: includeEvents,
+                                  onChanged:
+                                      (value) =>
+                                          setState(() => includeEvents = value),
+                                  title: const Text(
+                                    'Include live events on route',
+                                  ),
+                                  subtitle: const Text(
+                                    'Detours for concerts, closures, and disruptions',
+                                  ),
+                                ),
+                                const SizedBox(height: 10),
+                                SizedBox(
+                                  width: double.infinity,
+                                  child: ElevatedButton.icon(
+                                    onPressed:
+                                        _isRouting || tokenMissing
+                                            ? null
+                                            : () => _planRoute(context),
+                                    icon: const Icon(Icons.play_circle_fill),
+                                    label: Text(
+                                      _isRouting ? 'Planning…' : 'Plan route',
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(height: 10),
+                                OutlinedButton.icon(
+                                  onPressed:
+                                      _isRouting ? null : _triggerDemoReroute,
+                                  icon: const Icon(Icons.alt_route),
+                                  label: const Text('Trigger demo reroute'),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 14),
+                        _InsightRow(plan: effectivePlan),
+                        const SizedBox(height: 12),
+                        if (includeEvents)
+                          Card(
+                            child: Padding(
+                              padding: const EdgeInsets.all(16),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    'Events on route',
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .titleMedium
+                                        ?.copyWith(fontWeight: FontWeight.w700),
+                                  ),
+                                  const SizedBox(height: 8),
+                                  if (effectivePlan.events.isEmpty)
+                                    const Text('No major events detected.')
+                                  else
+                                    ...effectivePlan.events
+                                        .map(
+                                          (event) => ListTile(
+                                            contentPadding: EdgeInsets.zero,
+                                            leading: const Icon(
+                                              Icons.emergency_share,
+                                              color: Color(0xFFF6A609),
+                                            ),
+                                            title: Text(event),
+                                          ),
+                                        )
+                                        .toList(),
+                                ],
                               ),
                             ),
                           ),
-                          title: Text(entry.value),
+                        const SizedBox(height: 12),
+                        Card(
+                          child: Padding(
+                            padding: const EdgeInsets.all(16),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  'Live monitoring',
+                                  style: Theme.of(context).textTheme.titleMedium
+                                      ?.copyWith(fontWeight: FontWeight.w700),
+                                ),
+                                const SizedBox(height: 10),
+                                Row(
+                                  children: [
+                                    Expanded(
+                                      child: _pill(
+                                        'Congestion',
+                                        effectivePlan.congestionScore,
+                                        AppTheme.accent,
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    Expanded(
+                                      child: _pill(
+                                        'ETA',
+                                        effectivePlan.eta,
+                                        AppTheme.primary,
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    Expanded(
+                                      child: _pill(
+                                        'Distance',
+                                        effectivePlan.distance,
+                                        const Color(0xFFF6A609),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            ),
+                          ),
                         ),
-                      )
-                      .toList(),
-                ],
-              ),
+                        const SizedBox(height: 12),
+                        Card(
+                          child: Padding(
+                            padding: const EdgeInsets.all(16),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  'Eco impact',
+                                  style: Theme.of(context).textTheme.titleMedium
+                                      ?.copyWith(fontWeight: FontWeight.w700),
+                                ),
+                                const SizedBox(height: 10),
+                                const Text(
+                                  'CO2 savings compared to typical route',
+                                ),
+                                const SizedBox(height: 6),
+                                LinearProgressIndicator(
+                                  value: 0.62,
+                                  backgroundColor: const Color(0xFFE8F1FA),
+                                  color: AppTheme.accent,
+                                  minHeight: 10,
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                                const SizedBox(height: 8),
+                                Text(
+                                  'Estimated savings: ${effectivePlan.co2Savings}',
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        // Route instructions UI hidden on request.
+                        const SizedBox(height: 20),
+                      ],
+                    ),
+                  ),
+                );
+              },
             ),
           ),
-          const SizedBox(height: 20),
         ],
       ),
     );
@@ -512,139 +878,6 @@ class _SmartRoutingPageState extends State<SmartRoutingPage> {
   }
 }
 
-class _MapboxView extends StatelessWidget {
-  const _MapboxView({
-    required this.accessToken,
-    required this.initialCamera,
-    required this.onMapCreated,
-    required this.onRecenter,
-    required this.onLayers,
-    required this.onZoomIn,
-    required this.onZoomOut,
-  });
-
-  final String accessToken;
-  final CameraOptions initialCamera;
-  final ValueChanged<MapboxMap> onMapCreated;
-  final VoidCallback onRecenter;
-  final VoidCallback onLayers;
-  final VoidCallback onZoomIn;
-  final VoidCallback onZoomOut;
-  @override
-  Widget build(BuildContext context) {
-    final bool tokenMissing =
-        accessToken.isEmpty || accessToken == 'REPLACE_WITH_MAPBOX_TOKEN';
-
-    return Card(
-      elevation: 2,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-      clipBehavior: Clip.antiAlias,
-      child: SizedBox(
-        height: 360,
-        child: Stack(
-          children: [
-            Positioned.fill(
-              child: MapWidget(
-                key: const ValueKey('mapbox-view'),
-                cameraOptions: initialCamera,
-                styleUri: MapboxStyles.MAPBOX_STREETS,
-                onMapCreated: onMapCreated,
-              ),
-            ),
-            if (tokenMissing)
-              Positioned(
-                top: 12,
-                left: 12,
-                right: 12,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 10,
-                  ),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFFF6A609),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: const Text(
-                    'Add your Mapbox access token to enable the live map.',
-                    style: TextStyle(
-                      fontWeight: FontWeight.w700,
-                      color: Colors.black87,
-                    ),
-                  ),
-                ),
-              ),
-            if (!tokenMissing)
-              Positioned(
-                bottom: 12,
-                left: 12,
-                right: 12,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(12),
-                    boxShadow: const [
-                      BoxShadow(
-                        color: Color(0x14000000),
-                        blurRadius: 8,
-                        offset: Offset(0, 4),
-                      ),
-                    ],
-                  ),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: const [
-                      Icon(Icons.traffic, color: Color(0xFF2D6AA7)),
-                      SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          'Live traffic applied to routing',
-                          style: TextStyle(fontWeight: FontWeight.w700),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            Positioned(
-              top: 16,
-              right: 16,
-              child: Column(
-                children: [
-                  _FloatingControlButton(
-                    icon: Icons.my_location,
-                    onTap: onRecenter,
-                    tooltip: 'Recenter',
-                  ),
-                  const SizedBox(height: 10),
-                  _FloatingControlButton(
-                    icon: Icons.layers,
-                    onTap: onLayers,
-                    tooltip: 'Layers',
-                  ),
-                  const SizedBox(height: 10),
-                  _FloatingControlButton(
-                    icon: Icons.add,
-                    onTap: onZoomIn,
-                    tooltip: 'Zoom in',
-                  ),
-                  const SizedBox(height: 10),
-                  _FloatingControlButton(
-                    icon: Icons.remove,
-                    onTap: onZoomOut,
-                    tooltip: 'Zoom out',
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
 class _LngLat {
   const _LngLat({required this.lng, required this.lat});
 
@@ -660,14 +893,18 @@ class _RouteResult {
     required this.durationSeconds,
     required this.congestionLabel,
     required this.steps,
-    required this.events,
+    required this.path,
+    required this.origin,
+    required this.destination,
   });
 
   final double distanceMeters;
   final int durationSeconds;
   final String congestionLabel;
   final List<String> steps;
-  final List<String> events;
+  final List<_LngLat> path;
+  final _LngLat origin;
+  final _LngLat destination;
 }
 
 class _FloatingControlButton extends StatelessWidget {
