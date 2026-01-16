@@ -14,15 +14,15 @@ class ParkingPredictionPage extends StatefulWidget {
 }
 
 class _ParkingPredictionPageState extends State<ParkingPredictionPage> {
-  final TextEditingController areaController = TextEditingController(
-    text: 'Shopping',
-  );
-  String areaType = 'Commercial';
-  String timeOfDay = 'Evening (5-9 PM)';
+  final TextEditingController areaController = TextEditingController();
+  String? areaType;
+  String? timeOfDay;
   List<ParkingPrediction> predictions = const [];
   List<bool> slotStatuses = const [];
   bool _loading = true;
+  bool _migrating = false;
   String? _error;
+  String _dataSource = 'Loading...';
   List<ParkingRecord> _records = const [];
   final ParkingDataService _dataService = ParkingDataService();
 
@@ -40,18 +40,59 @@ class _ParkingPredictionPageState extends State<ParkingPredictionPage> {
 
   Future<void> _loadData() async {
     try {
-      final data = await _dataService.loadParkingStream();
+      // Try Firestore first
+      final firestoreData = await _dataService.loadFromFirestore(limit: 100);
+      if (firestoreData.isNotEmpty) {
+        if (!mounted) return;
+        setState(() {
+          _records = firestoreData;
+          _dataSource = 'Firebase (${firestoreData.length} records)';
+          _loading = false;
+        });
+        return;
+      }
+
+      // Fallback to CSV
+      final csvData = await _dataService.loadFromCsv();
       if (!mounted) return;
       setState(() {
-        _records = data;
+        _records = csvData;
+        _dataSource = 'Local CSV (${csvData.length} records)';
         _loading = false;
       });
     } catch (e) {
       if (!mounted) return;
       setState(() {
         _error = 'Failed to load parking data: $e';
+        _dataSource = 'Error';
         _loading = false;
       });
+    }
+  }
+
+  Future<void> _migrateToFirebase() async {
+    setState(() => _migrating = true);
+    try {
+      final count = await _dataService.migrateCsvToFirestore(batchSize: 500);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('✅ Migrated $count records to Firebase!'),
+          backgroundColor: Colors.green,
+        ),
+      );
+      // Reload data from Firestore
+      await _loadData();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('❌ Migration failed: $e'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _migrating = false);
     }
   }
 
@@ -82,25 +123,38 @@ class _ParkingPredictionPageState extends State<ParkingPredictionPage> {
         totalOcc += r.occupancy.clamp(0, r.capacity);
       }
     }
-    // Default to 35% occupancy if no valid data (meaning 65% available)
-    final double occupancyRate = totalCap > 0 ? (totalOcc / totalCap) : 0.35;
 
     final timeFactor = _timeFactor(timeOfDay);
     final areaFactor = _areaFactor(areaType);
-    // Adjust occupancy rate by time/area factors (keep between 15% and 70%)
-    // This ensures at least 30% slots are always shown as available
-    final adjustedRate = (occupancyRate * timeFactor * areaFactor).clamp(
-      0.15,
-      0.70,
+
+    // Use actual capacity from dataset (cap display at 100 slots for UI, min 20)
+    final int rawCapacity =
+        matches.isNotEmpty ? matches.first.capacity : totalCap.round();
+    // Ensure capacity is at least 1 to avoid division by zero
+    final int actualCapacity = rawCapacity > 0 ? rawCapacity : 100;
+    final int displaySlots = actualCapacity.clamp(20, 100);
+
+    // Calculate actual occupancy from dataset
+    final int actualOccupancy =
+        matches.isNotEmpty ? matches.first.occupancy : totalOcc.round();
+
+    // Apply time/area adjustments to real data
+    final int adjustedOccupied = (actualOccupancy * timeFactor * areaFactor)
+        .round()
+        .clamp(0, actualCapacity);
+    final int realAvailable = actualCapacity - adjustedOccupied;
+
+    // Scale for display (proportionally map to displaySlots)
+    final double scaleFactor =
+        actualCapacity > 0 ? displaySlots / actualCapacity : 1.0;
+    final int displayOccupied = (adjustedOccupied * scaleFactor).round().clamp(
+      0,
+      displaySlots,
     );
+    final int displayAvailable = displaySlots - displayOccupied;
 
-    const int totalSlots = 30; // Fixed display slots for demo
-    final int occupied = (totalSlots * adjustedRate).round();
-    // Ensure at least 5 slots are available for better UX
-    final int available = (totalSlots - occupied).clamp(5, totalSlots - 3);
-    final int actualOccupied = totalSlots - available;
-
-    final availabilityFraction = totalSlots == 0 ? 0.0 : available / totalSlots;
+    final availabilityFraction =
+        actualCapacity == 0 ? 0.0 : realAvailable / actualCapacity;
     final confidence =
         availabilityFraction > 0.6
             ? 'High'
@@ -108,11 +162,12 @@ class _ParkingPredictionPageState extends State<ParkingPredictionPage> {
             ? 'Medium'
             : 'Low';
 
-    // Create slots with random distribution of free/occupied
+    // Create slots with random distribution of free/occupied for display
     final rng = Random();
-    final slots = List<bool>.generate(totalSlots, (_) => false);
-    final freeIndices = List<int>.generate(totalSlots, (i) => i)..shuffle(rng);
-    for (var i = 0; i < available; i++) {
+    final slots = List<bool>.generate(displaySlots, (_) => false);
+    final freeIndices = List<int>.generate(displaySlots, (i) => i)
+      ..shuffle(rng);
+    for (var i = 0; i < displayAvailable; i++) {
       slots[freeIndices[i]] = true;
     }
 
@@ -122,23 +177,24 @@ class _ParkingPredictionPageState extends State<ParkingPredictionPage> {
         ParkingPrediction(
           name:
               matches.isNotEmpty ? matches.first.systemCode : 'Suggested area',
-          available: available,
+          available: realAvailable,
           confidence: confidence,
-          eta: 'Based on dataset snapshot',
+          eta: 'Capacity: $actualCapacity • Occupied: $adjustedOccupied',
         ),
       ];
       slotStatuses = slots;
     });
   }
 
-  double _timeFactor(String slot) {
+  double _timeFactor(String? slot) {
+    if (slot == null) return 1.0;
     if (slot.startsWith('Morning')) return 0.9;
     if (slot.startsWith('Afternoon')) return 1.0;
     if (slot.startsWith('Evening')) return 1.15;
     return 0.85; // Late night
   }
 
-  double _areaFactor(String type) {
+  double _areaFactor(String? type) {
     switch (type) {
       case 'Commercial':
         return 1.1;
@@ -158,10 +214,113 @@ class _ParkingPredictionPageState extends State<ParkingPredictionPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Parking prediction')),
+      appBar: AppBar(
+        title: const Text(
+          'Parking Manager',
+          style: TextStyle(color: Colors.white),
+        ),
+        backgroundColor: Color.fromARGB(207, 83, 149, 207),
+        actions: [
+          // Data source indicator
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: Center(
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color:
+                      _dataSource.contains('Firebase')
+                          ? Colors.green.withOpacity(0.2)
+                          : Colors.orange.withOpacity(0.2),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      _dataSource.contains('Firebase')
+                          ? Icons.cloud_done
+                          : Icons.storage,
+                      size: 16,
+                      color: Colors.white,
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      _dataSource.contains('Firebase') ? 'Cloud' : 'Local',
+                      style: const TextStyle(fontSize: 12, color: Colors.white),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
       body: ListView(
         padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
         children: [
+          // Data source info card
+          Card(
+            color:
+                _dataSource.contains('Firebase')
+                    ? Colors.green.shade50
+                    : Colors.orange.shade50,
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Row(
+                children: [
+                  Icon(
+                    _dataSource.contains('Firebase')
+                        ? Icons.cloud_done
+                        : Icons.storage,
+                    color:
+                        _dataSource.contains('Firebase')
+                            ? Colors.green
+                            : Colors.orange,
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Data Source: $_dataSource',
+                          style: const TextStyle(fontWeight: FontWeight.w600),
+                        ),
+                        if (!_dataSource.contains('Firebase'))
+                          const Text(
+                            'Migrate to Firebase for real-time sync',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.black54,
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                  if (!_dataSource.contains('Firebase') && !_loading)
+                    ElevatedButton.icon(
+                      onPressed: _migrating ? null : _migrateToFirebase,
+                      icon:
+                          _migrating
+                              ? const SizedBox(
+                                width: 16,
+                                height: 16,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                              : const Icon(Icons.cloud_upload, size: 18),
+                      label: Text(_migrating ? 'Migrating...' : 'Migrate'),
+                      style: ElevatedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(horizontal: 12),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
           Text(
             'Predict parking before you arrive.',
             style: Theme.of(context).textTheme.headlineSmall?.copyWith(
@@ -199,12 +358,14 @@ class _ParkingPredictionPageState extends State<ParkingPredictionPage> {
                     controller: areaController,
                     decoration: const InputDecoration(
                       labelText: 'Area name',
+                      hintText: 'Enter area name',
                       prefixIcon: Icon(Icons.place_outlined),
                     ),
                   ),
                   const SizedBox(height: 12),
                   DropdownButtonFormField<String>(
                     value: areaType,
+                    hint: const Text('Select area type'),
                     items:
                         const [
                               'Commercial',
@@ -220,8 +381,7 @@ class _ParkingPredictionPageState extends State<ParkingPredictionPage> {
                               ),
                             )
                             .toList(),
-                    onChanged:
-                        (value) => setState(() => areaType = value ?? areaType),
+                    onChanged: (value) => setState(() => areaType = value),
                     decoration: const InputDecoration(
                       labelText: 'Area type',
                       prefixIcon: Icon(Icons.layers),
@@ -230,6 +390,7 @@ class _ParkingPredictionPageState extends State<ParkingPredictionPage> {
                   const SizedBox(height: 12),
                   DropdownButtonFormField<String>(
                     value: timeOfDay,
+                    hint: const Text('Select time of day'),
                     items:
                         const [
                               'Morning (6-11 AM)',
@@ -244,9 +405,7 @@ class _ParkingPredictionPageState extends State<ParkingPredictionPage> {
                               ),
                             )
                             .toList(),
-                    onChanged:
-                        (value) =>
-                            setState(() => timeOfDay = value ?? timeOfDay),
+                    onChanged: (value) => setState(() => timeOfDay = value),
                     decoration: const InputDecoration(
                       labelText: 'Time of day',
                       prefixIcon: Icon(Icons.access_time),
@@ -317,21 +476,33 @@ class _ParkingPredictionPageState extends State<ParkingPredictionPage> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text(
-                      'Slot view',
-                      style: TextStyle(fontWeight: FontWeight.w700),
+                    Row(
+                      children: [
+                        const Text(
+                          'Slot view',
+                          style: TextStyle(fontWeight: FontWeight.w700),
+                        ),
+                        const Spacer(),
+                        Text(
+                          '${slotStatuses.where((s) => s).length} / ${slotStatuses.length} available',
+                          style: const TextStyle(
+                            fontWeight: FontWeight.w600,
+                            color: Color(0xFF2E7D32),
+                          ),
+                        ),
+                      ],
                     ),
                     const SizedBox(height: 10),
                     Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
+                      spacing: 6,
+                      runSpacing: 6,
                       children:
                           slotStatuses
                               .asMap()
                               .entries
                               .map(
                                 (entry) => _SlotChip(
-                                  label: 'S${entry.key + 1}',
+                                  slotNumber: entry.key + 1,
                                   isFree: entry.value,
                                 ),
                               )
@@ -358,40 +529,36 @@ class _ParkingPredictionPageState extends State<ParkingPredictionPage> {
 }
 
 class _SlotChip extends StatelessWidget {
-  const _SlotChip({required this.label, required this.isFree});
+  const _SlotChip({required this.slotNumber, required this.isFree});
 
-  final String label;
+  final int slotNumber;
   final bool isFree;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-      decoration: BoxDecoration(
-        color: isFree ? const Color(0xFFE8F5E9) : const Color(0xFFFFEBEE),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(
-          color: isFree ? const Color(0xFF2E7D32) : const Color(0xFFC62828),
-          width: 1.2,
-        ),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(
-            isFree ? Icons.check_circle : Icons.cancel,
-            size: 16,
+    return Tooltip(
+      message: 'Slot $slotNumber - ${isFree ? "Available" : "Occupied"}',
+      child: Container(
+        width: 36,
+        height: 36,
+        decoration: BoxDecoration(
+          color: isFree ? const Color(0xFF4CAF50) : const Color(0xFFE53935),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(
             color: isFree ? const Color(0xFF2E7D32) : const Color(0xFFC62828),
+            width: 1.5,
           ),
-          const SizedBox(width: 6),
-          Text(
-            label,
-            style: TextStyle(
-              color: isFree ? const Color(0xFF1B5E20) : const Color(0xFFB71C1C),
-              fontWeight: FontWeight.w700,
+        ),
+        child: Center(
+          child: Text(
+            '$slotNumber',
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 12,
+              fontWeight: FontWeight.bold,
             ),
           ),
-        ],
+        ),
       ),
     );
   }

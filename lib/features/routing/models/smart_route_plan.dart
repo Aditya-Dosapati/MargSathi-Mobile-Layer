@@ -1,3 +1,5 @@
+import 'h3_event.dart';
+
 class SmartRoutePlan {
   SmartRoutePlan({
     required this.distance,
@@ -6,6 +8,10 @@ class SmartRoutePlan {
     required this.congestionScore,
     required this.events,
     required this.instructions,
+    this.h3Events = const [],
+    this.routeCells = const {},
+    this.isRerouted = false,
+    this.rerouteReason,
   });
 
   final String distance;
@@ -14,6 +20,10 @@ class SmartRoutePlan {
   final String congestionScore;
   final List<String> events;
   final List<String> instructions;
+  final List<H3Event> h3Events;
+  final Set<BigInt> routeCells;
+  final bool isRerouted;
+  final String? rerouteReason;
 
   factory SmartRoutePlan.placeholder({required bool includeEvents}) {
     return SmartRoutePlan(
@@ -25,6 +35,32 @@ class SmartRoutePlan {
       instructions: const [
         'Add points above to generate turn-by-turn guidance.',
       ],
+    );
+  }
+
+  SmartRoutePlan copyWith({
+    String? distance,
+    String? eta,
+    String? co2Savings,
+    String? congestionScore,
+    List<String>? events,
+    List<String>? instructions,
+    List<H3Event>? h3Events,
+    Set<BigInt>? routeCells,
+    bool? isRerouted,
+    String? rerouteReason,
+  }) {
+    return SmartRoutePlan(
+      distance: distance ?? this.distance,
+      eta: eta ?? this.eta,
+      co2Savings: co2Savings ?? this.co2Savings,
+      congestionScore: congestionScore ?? this.congestionScore,
+      events: events ?? this.events,
+      instructions: instructions ?? this.instructions,
+      h3Events: h3Events ?? this.h3Events,
+      routeCells: routeCells ?? this.routeCells,
+      isRerouted: isRerouted ?? this.isRerouted,
+      rerouteReason: rerouteReason ?? this.rerouteReason,
     );
   }
 }

@@ -37,6 +37,11 @@ dependencies:
   google_fonts: ^6.2.1
   mapbox_maps_flutter: ^2.17.0
   http: ^1.2.1
+  # H3 hexagonal grid system for dynamic routing
+  h3_flutter: ^0.7.1
+  geojson2h3: ^0.7.0
+  firebase_core: ^4.3.0
+  cloud_firestore: ^6.1.1
 
 dev_dependencies:
   flutter_test:

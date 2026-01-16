@@ -1,4 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:mapbox_maps_flutter/mapbox_maps_flutter.dart';
+import 'firebase_options.dart';
 import 'features/auth/screens/login_page.dart';
 import 'features/home/screens/home_page.dart';
 import 'features/home/screens/profile_page.dart';
@@ -7,7 +10,19 @@ import 'features/routing/screens/smart_routing_page.dart';
 import 'features/shared/theme/app_theme.dart';
 import 'features/sign_translation/screens/sign_translation_page.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Initialize Firebase
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+
+  // Set Mapbox access token from dart-define or use a default
+  const String accessToken = String.fromEnvironment(
+    'MAPBOX_ACCESS_TOKEN',
+    defaultValue: 'pk.',
+  );
+  MapboxOptions.setAccessToken(accessToken);
+
   runApp(const MargSathiApp());
 }
 

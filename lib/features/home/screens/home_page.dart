@@ -79,19 +79,19 @@ class HomePage extends StatelessWidget {
             children: banners.map((item) => _InfoBanner(data: item)).toList(),
           ),
           const SizedBox(height: 18),
-          Row(
-            children: const [
-              Expanded(child: _StatCard(label: 'Core Features', value: '3+')),
-              SizedBox(width: 12),
-              Expanded(
-                child: _StatCard(label: 'Languages Supported', value: '9+'),
-              ),
-              SizedBox(width: 12),
-              Expanded(
-                child: _StatCard(label: 'Real-time Updates', value: '24/7'),
-              ),
-            ],
-          ),
+          // Row(
+          //   children: const [
+          //     Expanded(child: _StatCard(label: 'Core Features', value: '3+')),
+          //     SizedBox(width: 12),
+          //     Expanded(
+          //       child: _StatCard(label: 'Languages Supported', value: '9+'),
+          //     ),
+          //     SizedBox(width: 12),
+          //     Expanded(
+          //       child: _StatCard(label: 'Real-time Updates', value: '24/7'),
+          //     ),
+          //   ],
+          // ),
           const SizedBox(height: 18),
         ],
       ),
